@@ -1691,7 +1691,7 @@ def explain_endpoint(
             end_exclusive,
         )
 
-        plan =  plan = db.command(
+        plan = db.command(
             {
                 "explain": {
                     "aggregate": "employees",
