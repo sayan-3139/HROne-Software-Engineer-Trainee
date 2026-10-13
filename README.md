@@ -83,6 +83,33 @@ The `sample_data/` directory contains sample employee and attendance data. Revie
 - `DECISIONS.md` — Design decisions.
 - `sample_data/` — Sample data.
 
+## Analytics and Query Performance
+
+The API provides employee-level monthly statistics, department summaries, late-arrival rankings, and daily department attendance trends.
+
+MongoDB aggregation pipelines are used for department trend calculations, including calendar-day generation, attendance-rate calculation, and seven-calendar-day moving averages.
+
+The `/admin/explain/{endpoint}` endpoint returns MongoDB execution-plan details for supported analytics and attendance queries. Review the execution statistics to verify index usage and identify collection scans.
+
+Available explain endpoint names:
+
+- `attendance_list`
+- `employee_monthly`
+- `department_summary`
+- `late_leaderboard`
+- `department_trend`
+
+## Verification
+
+The following checks have been performed:
+
+- Python syntax compilation using `python -m py_compile app/main.py`.
+- API startup and Swagger documentation access.
+- Explain-plan checks for all five supported endpoints.
+- Index usage verification for the tested queries and aggregation pipeline.
+
+The explain results showed index scans and no collection scan in the tested winning query plans or the reported attendance lookup statistics. These results reflect the tested data and do not constitute a large-scale performance benchmark.
+
 ## Submission Notes
 
 - Keep the repository public as required by the assignment.
