@@ -77,3 +77,25 @@ I reviewed the starter implementation in `app/main.py` and compared its behavior
 **Issue:** Query execution-plan inspection was missing.
 
 **Change made:** Added an initial explain endpoint.
+
+### 13. Analytics Accuracy and Edge Cases
+
+**Issue:** Analytics results can be incorrect if employees without attendance records are excluded, date boundaries are handled incorrectly, or ranking ties are not preserved.
+
+**Change made:** Added employee eligibility checks, date-range filtering, department headcount calculations, and deterministic leaderboard sorting. Department trend calculations generate calendar-day rows and handle missing attendance data.
+
+**Verification needed:** Test employees without attendance records, joining dates within the selected month, empty attendance days, and tied leaderboard totals.
+
+### 14. Query Execution Plans
+
+**Issue:** The original implementation did not provide execution-plan inspection for the supported endpoints.
+
+**Change made:** Added an explain endpoint that builds execution plans for the corresponding database queries or aggregation pipelines, including relevant filters and pagination parameters.
+
+**Verification:** Tested the explain endpoint for attendance listing, employee monthly analytics, department summaries, late-arrival rankings, and department trends. The tested queries used indexes and did not report collection scans in their execution statistics.
+
+### 15. Remaining Limitations
+
+The current implementation should be tested with a larger dataset before making performance claims at scale. Execution-plan results from a small sample do not establish performance under 100 times the original data volume. Additional testing should cover concurrent punch-in requests, duplicate attendance records, invalid input values, missing employee records, and boundary dates.
+
+The analytics endpoints should also be checked against the expected API response schemas and the requirements in `openapi.yaml`. Any unresolved issue discovered during these tests should be documented rather than described as fixed.

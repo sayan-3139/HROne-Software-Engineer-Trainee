@@ -14,24 +14,30 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 from pymongo import MongoClient
+from bson.json_util import dumps, loads
+
 
 load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
-
+# Create indexes for faster queries and prevent duplicate records
 db.employees.create_index("emp_code", unique=True)
+db.employees.create_index("department")
+
+
 db.attendance_logs.create_index(
     [("emp_code", 1), ("date", 1)],
-    unique=True,
+    unique=True
 )
+
 db.attendance_logs.create_index(
     [("date", -1), ("emp_code", 1)]
 )
-
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -406,8 +412,8 @@ def list_attendance(
         "page": page,
         "page_size": page_size,
     }
-    
-    
+
+
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -416,18 +422,29 @@ def punch_out(body: PunchInIn):
         raise HTTPException(status_code=404, detail="Employee not found")
 
     if body.punched_at is not None:
-        if isinstance(body.punched_at, bool) or body.punched_at < 100000000000:
+        if (
+            isinstance(body.punched_at, bool)
+            or body.punched_at < 100000000000
+        ):
             raise HTTPException(
                 status_code=422,
-                detail="punched_at must be epoch milliseconds"
+                detail="punched_at must be epoch milliseconds",
             )
-        punch_out_time = datetime.fromtimestamp(
-            body.punched_at / 1000, tz=timezone.utc
-        )
-    else:
-        punch_out_time = datetime.now(timezone.utc)
 
-    punch_out_time = punch_out_time.replace(microsecond=0)
+        try:
+            punch_out_time = datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=timezone.utc,
+            ).replace(microsecond=0)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid punch_out timestamp",
+            )
+    else:
+        punch_out_time = datetime.now(timezone.utc).replace(
+            microsecond=0
+        )
 
     record = db.attendance_logs.find_one(
         {
@@ -441,29 +458,33 @@ def punch_out(body: PunchInIn):
     if not record:
         raise HTTPException(
             status_code=404,
-            detail="No open punch-in record found"
+            detail="No open punch-in record found",
         )
 
     punch_in_time = record["punch_in"]
 
+    # MongoDB may return naive datetimes even when stored in UTC.
+    # Treat those values as UTC before comparing them.
+    if punch_in_time.tzinfo is None:
+        punch_in_time = punch_in_time.replace(tzinfo=timezone.utc)
+
     if punch_out_time <= punch_in_time:
         raise HTTPException(
             status_code=422,
-            detail="punch_out must be after punch_in"
+            detail="punch_out must be after punch_in",
         )
 
     if punch_out_time > punch_in_time + timedelta(hours=24):
         raise HTTPException(
             status_code=422,
-            detail="punch_out cannot be more than 24 hours after punch_in"
+            detail="punch_out cannot be more than 24 hours after punch_in",
         )
 
     work_hours = compute_work_hours(punch_in_time, punch_out_time)
 
-    shift_end = emp["shift_end"]
     overtime_minutes = compute_overtime(
         punch_out_time.astimezone(IST),
-        shift_end,
+        emp["shift_end"],
         record["date"],
     )
 
@@ -487,8 +508,18 @@ def punch_out(body: PunchInIn):
     if result.modified_count != 1:
         raise HTTPException(
             status_code=409,
-            detail="Attendance record was already punched out"
+            detail="Attendance record was already punched out",
         )
+
+    history = record.get("history", [])
+    for entry in history:
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = int(entry["at"].timestamp() * 1000)
+
+        for key in ("punch_in", "punch_out"):
+            value = entry.get("changes", {}).get(key)
+            if isinstance(value, datetime):
+                entry["changes"][key] = int(value.timestamp() * 1000)
 
     return {
         "emp_code": record["emp_code"],
@@ -500,8 +531,9 @@ def punch_out(body: PunchInIn):
         "late_minutes": record.get("late_minutes", 0),
         "overtime_minutes": overtime_minutes,
         "half_day": half_day,
-        "history": record.get("history", []),
+        "history": history,
     }
+
 
 
 @app.patch("/attendance/{emp_code}/{date}")
@@ -1043,128 +1075,310 @@ def late_leaderboard(
 
 
 
+def build_department_trend_pipeline(
+    department,
+    employees,
+    employee_codes,
+    start_datetime,
+    end_exclusive,
+):
+    return [
+       {"$match": {"department": department}},
+       {"$limit": 1},
+       {"$project": {"_id": 0, "date_value": {"$literal": start_datetime}}},
+        {
+            "$densify": {
+                "field": "date_value",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [start_datetime, end_exclusive],
+                },
+            }
+        },
+        {
+            "$set": {
+                "employees": {"$literal": employees},
+                "date": {
+                    "$dateToString": {
+                        "format": "%Y-%m-%d",
+                        "date": "$date_value",
+                        "timezone": "UTC",
+                    }
+                },
+                "is_working_day": {
+                    "$not": [
+                        {
+                            "$in": [
+                                {"$dayOfWeek": "$date_value"},
+                                [1, 7],
+                            ]
+                        }
+                    ]
+                },
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "date",
+                "foreignField": "date",
+                "pipeline": [
+                    {"$match": {"emp_code": {"$in": employee_codes}}}
+                ],
+                "as": "logs",
+            }
+        },
+        {
+            "$set": {
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$employees",
+                            "as": "emp",
+                            "cond": {
+                                "$and": [
+                                    {
+                                        "$ne": [
+                                            {"$ifNull": ["$$emp.joined_on", None]},
+                                            None,
+                                        ]
+                                    },
+                                    {"$lte": ["$$emp.joined_on", "$date"]},
+                                ]
+                            },
+                        }
+                    }
+                },
+                "present_count": {
+                    "$reduce": {
+                        "input": "$logs",
+                        "initialValue": 0.0,
+                        "in": {
+                            "$add": [
+                                "$$value",
+                                {
+                                    "$cond": [
+                                        {
+                                            "$in": [
+                                                "$$this.status",
+                                                ["PRESENT", "WFH", "ON_DUTY"],
+                                            ]
+                                        },
+                                        {
+                                            "$cond": [
+                                                {
+                                                    "$eq": [
+                                                        {"$ifNull": ["$$this.half_day", False]},
+                                                        True,
+                                                    ]
+                                                },
+                                                0.5,
+                                                1.0,
+                                            ]
+                                        },
+                                        0.0,
+                                    ]
+                                },
+                            ]
+                        },
+                    }
+                },
+                "late_count": {
+                    "$reduce": {
+                        "input": "$logs",
+                        "initialValue": 0,
+                        "in": {
+                            "$add": [
+                                "$$value",
+                                {
+                                    "$cond": [
+                                        {
+                                            "$gt": [
+                                                {"$ifNull": ["$$this.late_minutes", 0]},
+                                                0,
+                                            ]
+                                        },
+                                        1,
+                                        0,
+                                    ]
+                                },
+                            ]
+                        },
+                    }
+                },
+            }
+        },
+        {
+            "$set": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                "$is_working_day",
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {
+                            "$divide": [
+                                {
+                                    "$floor": {
+                                        "$add": [
+                                            {
+                                                "$multiply": [
+                                                    {
+                                                        "$divide": [
+                                                            {"$multiply": ["$present_count", 100]},
+                                                            "$headcount",
+                                                        ]
+                                                    },
+                                                    10000,
+                                                ]
+                                            },
+                                            0.5,
+                                        ]
+                                    }
+                                },
+                                10000,
+                            ]
+                        },
+                        None,
+                    ]
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"date_value": 1},
+                "output": {
+                    "moving_avg_raw": {
+                        "$avg": "$attendance_rate",
+                        "window": {"documents": [-6, 0]},
+                    }
+                },
+            }
+        },
+        {
+            "$set": {
+                "moving_avg_7d": {
+                    "$cond": [
+                        {"$ne": ["$moving_avg_raw", None]},
+                        {
+                            "$divide": [
+                                {
+                                    "$floor": {
+                                        "$add": [
+                                            {"$multiply": ["$moving_avg_raw", 10000]},
+                                            0.5,
+                                        ]
+                                    }
+                                },
+                                10000,
+                            ]
+                        },
+                        None,
+                    ]
+                }
+            }
+        },
+        {"$sort": {"date_value": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1,
+            }
+        },
+    ]
+
+
+
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(
     department: str,
     from_date: str = __import__("fastapi").Query(..., alias="from"),
     to_date: str = __import__("fastapi").Query(..., alias="to"),
 ):
-    from decimal import Decimal, ROUND_HALF_UP
-
     try:
         start = datetime.strptime(from_date, "%Y-%m-%d").date()
         end = datetime.strptime(to_date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(
             status_code=422,
-            detail="from and to must use YYYY-MM-DD format"
+            detail="from and to must use YYYY-MM-DD format",
         )
 
     if end < start:
         raise HTTPException(
             status_code=422,
-            detail="to must not be before from"
+            detail="to must not be before from",
         )
 
     if (end - start).days + 1 > 92:
         raise HTTPException(
             status_code=422,
-            detail="Date range cannot exceed 92 days"
+            detail="Date range cannot exceed 92 days",
         )
 
-    employees = list(db.employees.find({"department": department}))
+    employees = list(
+        db.employees.find(
+            {"department": department},
+            {"_id": 0, "emp_code": 1, "joined_on": 1},
+        )
+    )
+
     if not employees:
         raise HTTPException(
             status_code=404,
-            detail="No employees found in department"
+            detail="No employees found in department",
         )
 
-    joined_dates = {}
-    for emp in employees:
-        try:
-            joined_dates[emp["emp_code"]] = datetime.strptime(
-                emp["joined_on"], "%Y-%m-%d"
-            ).date()
-        except ValueError:
-            continue
+    employee_codes = [
+        emp["emp_code"] for emp in employees
+    ]
 
-    logs = list(db.attendance_logs.find({
-        "emp_code": {"$in": list(joined_dates.keys())},
-        "date": {
-            "$gte": start.isoformat(),
-            "$lte": end.isoformat(),
-        },
-    }))
+    start_datetime = datetime.combine(start, datetime.min.time())
+    end_exclusive = datetime.combine(
+        end + timedelta(days=1),
+        datetime.min.time(),
+    )
 
-    logs_by_date = {}
-    for log in logs:
-        logs_by_date.setdefault(log["date"], []).append(log)
+    pipeline = build_department_trend_pipeline(
+        department,
+        employees,
+        employee_codes,
+        start_datetime,
+        end_exclusive,
+    )
 
-    rows = []
-    current = start
+    items = list(db.employees.aggregate(pipeline))
 
-    while current <= end:
-        day_string = current.isoformat()
-        headcount = sum(
-            1 for joined in joined_dates.values() if joined <= current
-        )
-
-        present_count = 0.0
-        late_count = 0
-
-        for log in logs_by_date.get(day_string, []):
-            if log["status"] in {"PRESENT", "WFH", "ON_DUTY"}:
-                present_count += (
-                    0.5 if log.get("half_day", False) else 1.0
-                )
-
-            if (log.get("late_minutes", 0) or 0) > 0:
-                late_count += 1
-
-        working_day = current.weekday() < 5
-        attendance_rate = None
-
-        if working_day and headcount > 0:
-            attendance_rate = float(
-                Decimal(str(present_count * 100 / headcount)).quantize(
-                    Decimal("0.0001"),
-                    rounding=ROUND_HALF_UP,
-                )
-            )
-
-        rows.append({
-            "date": day_string,
-            "is_working_day": working_day,
-            "headcount": headcount,
-            "present_count": present_count,
-            "late_count": late_count,
-            "attendance_rate": attendance_rate,
-            "moving_avg_7d": None,
-        })
-
-        current += timedelta(days=1)
-
-    for i, row in enumerate(rows):
-        rates = [
-            item["attendance_rate"]
-            for item in rows[max(0, i - 6):i + 1]
-            if item["attendance_rate"] is not None
-        ]
-
-        if rates:
-            row["moving_avg_7d"] = float(
-                Decimal(str(sum(rates) / len(rates))).quantize(
-                    Decimal("0.0001"),
-                    rounding=ROUND_HALF_UP,
-                )
-            )
-
-    return rows
-
+    return {
+        "department": department,
+        "items": items,
+    }
 
 
 @app.get("/admin/explain/{endpoint}")
-def explain_endpoint(endpoint: str):
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = 10,
+    from_date: Optional[str] = __import__("fastapi").Query(None, alias="from"),
+    to_date: Optional[str] = __import__("fastapi").Query(None, alias="to"),
+):
     allowed_endpoints = {
         "attendance_list",
         "employee_monthly",
@@ -1176,28 +1390,326 @@ def explain_endpoint(endpoint: str):
     if endpoint not in allowed_endpoints:
         raise HTTPException(
             status_code=422,
-            detail="Unsupported endpoint name"
+            detail="Unsupported endpoint name",
         )
 
-    # Provide an explain plan for the attendance-list query.
-    # The other endpoint plans will be implemented with their
-    # respective filters and aggregation pipelines.
-    if endpoint == "attendance_list":
-        plan = db.command({
-            "explain": {
-                "find": "attendance_logs",
-                "filter": {},
-                "sort": {"date": -1, "emp_code": 1},
-                "skip": 0,
-                "limit": 20,
-            },
+    def explain_find(collection, query, **options):
+        command = {
+            "find": collection,
+            "filter": query,
+        }
+        command.update(options)
+
+        return db.command({
+            "explain": command,
             "verbosity": "executionStats",
         })
-        return plan
+
+    if endpoint == "attendance_list":
+        if page < 1:
+            raise HTTPException(
+                status_code=422,
+                detail="page must be at least 1",
+            )
+
+        if page_size < 1 or page_size > 100:
+            raise HTTPException(
+                status_code=422,
+                detail="page_size must be between 1 and 100",
+            )
+
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(
+                status_code=422,
+                detail="date_from must not be after date_to",
+            )
+
+        query = {}
+
+        if emp_code:
+            query["emp_code"] = emp_code
+
+        if date_from or date_to:
+            query["date"] = {}
+
+            if date_from:
+                query["date"]["$gte"] = date_from
+
+            if date_to:
+                query["date"]["$lte"] = date_to
+
+        if status:
+            if status not in {
+                "PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"
+            }:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid attendance status",
+                )
+
+            query["status"] = status
+
+        plan = explain_find(
+            "attendance_logs",
+            query,
+            sort={"date": -1, "emp_code": 1},
+            skip=(page - 1) * page_size,
+            limit=page_size,
+        )
+
+        return Response(
+            content=dumps(plan),
+            media_type="application/json",
+        )
+
+    if endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(
+                status_code=422,
+                detail="emp_code and month are required",
+            )
+
+        try:
+            month_start = datetime.strptime(
+                month, "%Y-%m"
+            ).date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="month must use YYYY-MM format",
+            )
+
+        from calendar import monthrange
+
+        last_day = monthrange(
+            month_start.year, month_start.month
+        )[1]
+        month_end = month_start.replace(day=last_day)
+
+        if not db.employees.find_one({"emp_code": emp_code}):
+            raise HTTPException(
+                status_code=404,
+                detail="Employee not found",
+            )
+
+        query = {
+            "emp_code": emp_code,
+            "date": {
+                "$gte": month_start.isoformat(),
+                "$lte": month_end.isoformat(),
+            },
+        }
+
+        plan = explain_find("attendance_logs", query)
+
+        return Response(
+            content=dumps(plan),
+            media_type="application/json",
+        )
+
+    if endpoint == "department_summary":
+        if not month:
+            raise HTTPException(
+                status_code=422,
+                detail="month is required",
+            )
+
+        try:
+            month_start = datetime.strptime(
+                month, "%Y-%m"
+            ).date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="month must use YYYY-MM format",
+            )
+
+        from calendar import monthrange
+
+        last_day = monthrange(
+            month_start.year, month_start.month
+        )[1]
+        month_end = month_start.replace(day=last_day)
+
+        employee_query = {}
+        if department:
+            employee_query["department"] = department
+
+        employees = list(
+            db.employees.find(employee_query, {"_id": 0})
+        )
+
+        eligible_codes = []
+
+        for emp in employees:
+            try:
+                joined = datetime.strptime(
+                    emp["joined_on"], "%Y-%m-%d"
+                ).date()
+            except (ValueError, KeyError):
+                continue
+
+            if joined <= month_end:
+                eligible_codes.append(emp["emp_code"])
+
+        query = {
+            "emp_code": {"$in": eligible_codes},
+            "date": {
+                "$gte": month_start.isoformat(),
+                "$lte": month_end.isoformat(),
+            },
+        }
+
+        plan = explain_find("attendance_logs", query)
+
+        return Response(
+            content=dumps(plan),
+            media_type="application/json",
+        )
+
+    if endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(
+                status_code=422,
+                detail="month is required",
+            )
+
+        if limit < 1 or limit > 50:
+            raise HTTPException(
+                status_code=422,
+                detail="limit must be between 1 and 50",
+            )
+
+        try:
+            month_start = datetime.strptime(
+                month, "%Y-%m"
+            ).date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="month must use YYYY-MM format",
+            )
+
+        from calendar import monthrange
+
+        last_day = monthrange(
+            month_start.year, month_start.month
+        )[1]
+        month_end = month_start.replace(day=last_day)
+
+        employee_query = {}
+        if department:
+            employee_query["department"] = department
+
+        employees = list(
+            db.employees.find(employee_query, {"_id": 0})
+        )
+
+        eligible_codes = []
+
+        for emp in employees:
+            try:
+                joined = datetime.strptime(
+                    emp["joined_on"], "%Y-%m-%d"
+                ).date()
+            except (ValueError, KeyError):
+                continue
+
+            if joined <= month_end:
+                eligible_codes.append(emp["emp_code"])
+
+        query = {
+            "emp_code": {"$in": eligible_codes},
+            "date": {
+                "$gte": month_start.isoformat(),
+                "$lte": month_end.isoformat(),
+            },
+            "late_minutes": {"$gt": 0},
+        }
+
+        plan = explain_find("attendance_logs", query)
+
+        return Response(
+            content=dumps(plan),
+            media_type="application/json",
+        )
+
+    if endpoint == "department_trend":
+        if not department or not from_date or not to_date:
+            raise HTTPException(
+                status_code=422,
+                detail="department, from, and to are required",
+            )
+
+        try:
+            start = datetime.strptime(from_date, "%Y-%m-%d").date()
+            end = datetime.strptime(to_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="from and to must use YYYY-MM-DD format",
+            )
+
+        if end < start:
+            raise HTTPException(
+                status_code=422,
+                detail="to must not be before from",
+            )
+
+        if (end - start).days + 1 > 92:
+            raise HTTPException(
+                status_code=422,
+                detail="Date range cannot exceed 92 days",
+            )
+
+        employees = list(
+            db.employees.find(
+                {"department": department},
+                {"_id": 0, "emp_code": 1, "joined_on": 1},
+            )
+        )
+
+        if not employees:
+            raise HTTPException(
+                status_code=404,
+                detail="No employees found in department",
+            )
+
+        employee_codes = [emp["emp_code"] for emp in employees]
+
+        start_datetime = datetime.combine(start, datetime.min.time())
+        end_exclusive = datetime.combine(
+            end + timedelta(days=1),
+            datetime.min.time(),
+        )
+
+        pipeline = build_department_trend_pipeline(
+            department,
+            employees,
+            employee_codes,
+            start_datetime,
+            end_exclusive,
+        )
+
+        plan =  plan = db.command(
+            {
+                "explain": {
+                    "aggregate": "employees",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                "verbosity": "executionStats",
+            }
+        )
+
+        return Response(
+            content=dumps(plan),
+            media_type="application/json",
+        )
 
     raise HTTPException(
-        status_code=422,
-        detail="Required endpoint parameters are not yet implemented for this explain plan"
+        status_code=400,
+        detail="Unsupported explain endpoint",
     )
 
 
